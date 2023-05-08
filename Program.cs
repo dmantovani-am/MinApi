@@ -9,7 +9,6 @@ var options = new DbContextOptionsBuilder<DataContext>()
 
 using var context = new DataContext(options);
 
-
 var app = builder.Build();
 
 app.MapGet("/categories", () => context.Categories.ToListAsync());
@@ -31,6 +30,17 @@ app.MapDelete("/categories/{Id:int}", async (int id) =>
     await context.SaveChangesAsync();
 
     return Results.Ok(category);
+});
+
+app.MapPut("/categories/{Id:int}", async (int id, Category update) =>
+{
+	var category = await context.Categories.FindAsync(id);
+    if (category == null) return Results.NotFound();
+
+	category.Name = update.Name;
+	await context.SaveChangesAsync();
+
+	return Results.Ok(category);
 });
 
 app.Run();
