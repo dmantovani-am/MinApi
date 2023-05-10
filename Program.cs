@@ -1,63 +1,75 @@
 using Microsoft.EntityFrameworkCore;
 
-var builder = WebApplication.CreateBuilder(args);
+WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
-var connectionString = builder.Configuration.GetConnectionString("(default)");
-var options = new DbContextOptionsBuilder<DataContext>()
-	.UseSqlite(connectionString)
-	.Options;
+// InjectMemoryRepository(builder.Services);
+InjectDataContextRepository(builder.Services, builder.Configuration);
 
-using var context = new DataContext(options);
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
 
-var app = builder.Build();
+WebApplication app = builder.Build();
 
-app.MapGet("/categories", () => context.Categories.ToListAsync());
+// app.UseMiddleware<LoggingMiddleware>();
 
-app.MapGet("/categories/{Id:int}", async (int id) => 
+if (app.Environment.IsDevelopment())
 {
-    var category = await context.Categories.FindAsync(id);
-    if (category == null) return Results.NotFound();
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
 
-    return Results.Ok(category);
-});
+MapRoutes<Product>("Products");
+MapRoutes<Category>("Categories");
 
-app.MapDelete("/categories/{Id:int}", async (int id) =>
-{
-    var category = await context.Categories.FindAsync(id);
-    if (category == null) return Results.NotFound();
-
-    context.Categories.Remove(category);
-    await context.SaveChangesAsync();
-
-    return Results.Ok(category);
-});
-
-app.MapPut("/categories/{Id:int}", async (int id, Category update) =>
-{
-	var category = await context.Categories.FindAsync(id);
-    if (category == null) return Results.NotFound();
-
-	category.Name = update.Name;
-	await context.SaveChangesAsync();
-
-	return Results.Ok(category);
-});
+app.MapGet("/error", _ => throw new DivideByZeroException());
 
 app.Run();
 
 
-class DataContext : DbContext
+void InjectMemoryRepository(IServiceCollection services)
 {
-	public DataContext(DbContextOptions<DataContext> options)
-		: base(options)
-	{ }
-
-	public DbSet<Product> Products => Set<Product>();
-
-	public DbSet<Category> Categories => Set<Category>();
+    services.AddSingleton<IRepository<Product>>(new MemoryRepository<Product>());
+    services.AddSingleton<IRepository<Category>>(new MemoryRepository<Category>());
 }
 
-record Category
+void InjectDataContextRepository(IServiceCollection services, ConfigurationManager configuration)
+{
+    var options = new DbContextOptionsBuilder<DataContext>()
+        .UseSqlite(configuration.GetConnectionString("(default)"))
+        .Options;
+
+    var dataContext = new DataContext(options);
+    dataContext.Database.EnsureCreated();
+
+    services.AddScoped<DataContext>(_ => dataContext);
+    services.AddScoped<IRepository<Product>>(_ => new DataContextRepository<Product>(dataContext));
+    services.AddScoped<IRepository<Category>>(_ => new DataContextRepository<Category>(dataContext));
+}
+
+
+void MapRoutes<T>(string tag)
+    where T : class, IHasId
+{
+    var prefix = $"/{tag}";
+    var group = app.MapGroup(prefix).WithTags(tag);
+
+    group.MapGet("/", (IRepository<T> repository) => repository.GetAll());
+
+    group.MapGet("/{id}", (int id, IRepository<T> repository) => repository.Get(id))
+        .Produces<T>(200)
+        .Produces(404);
+
+    group.MapPost("/", (T product, IRepository<T> repository) => repository.Add(product));
+
+    group.MapDelete("/{id}", (int id, IRepository<T> repository) => repository.Delete(id));
+}
+
+interface IHasId
+{
+    int Id { get; set; }
+}
+
+record Category : IHasId
 {
 	public Category()
 	{
@@ -71,7 +83,7 @@ record Category
 	public ICollection<Product> Products { get; set; }
 }
 
-record Product
+record Product : IHasId
 {
 	public Product()
 	{
@@ -91,4 +103,130 @@ record Product
 	required public string Image { get; set; }
 
 	public ICollection<Category> Categories { get; set; }
+}
+
+interface IRepository<T>
+    where T : class, IHasId
+{
+    Task Add(T item);
+
+    Task Delete(int id);
+
+    IAsyncEnumerable<T> GetAll();
+
+    Task<T?> Get(int id);
+}
+
+class MemoryRepository<T> : IRepository<T>
+    where T : class, IHasId
+{
+    readonly Dictionary<int, T> dict = new();
+
+    public Task Add(T item)
+    {
+        dict[item.Id] = item;
+
+        return Task.CompletedTask;
+    }
+
+    public Task<T?> Get(int id)
+    {
+        return Task.FromResult(dict.TryGetValue(id, out var item) ? item : null);
+    }
+
+    public async IAsyncEnumerable<T> GetAll()
+    {
+        foreach (var item in dict.Values) yield return item;
+    }
+
+    public Task Delete(int id)
+    {
+        dict.Remove(id);
+
+        return Task.CompletedTask;
+    }
+}
+
+class DataContext : DbContext
+{
+    public DataContext(DbContextOptions<DataContext> options) 
+        : base(options)
+    { }
+
+    public DbSet<Product> Products => Set<Product>();
+
+    public DbSet<Category> Categories => Set<Category>();
+}
+
+class DataContextRepository<T> : IRepository<T>
+    where T : class, IHasId
+{
+    readonly DbContext _dataContext;
+
+    readonly DbSet<T> _entities;
+
+    public DataContextRepository(DbContext dataContext)
+    {
+        ArgumentNullException.ThrowIfNull(dataContext);
+
+        _dataContext = dataContext;
+        _entities = _dataContext.Set<T>();
+    }
+
+    public async Task Add(T entity)
+    {
+        await _entities.AddAsync(entity);
+        await _dataContext.SaveChangesAsync();
+    }
+
+    public async Task Delete(int id)
+    {
+        var entity = await Get(id);
+        if (entity != null)
+        {
+            _dataContext.Remove(entity);
+            await _dataContext.SaveChangesAsync();
+        }
+    }
+
+    public async Task<T?> Get(int id)
+    {
+        return await _dataContext.FindAsync<T>(id);
+    }
+
+    public IAsyncEnumerable<T> GetAll()
+    {
+        return _entities.AsAsyncEnumerable();
+    }
+}
+
+class LoggingMiddleware
+{
+    private readonly RequestDelegate _next;
+
+    private readonly ILoggerFactory _loggerFactory;
+
+    public LoggingMiddleware(RequestDelegate next, ILoggerFactory loggerFactory)
+    {
+        _next = next;
+        _loggerFactory = loggerFactory;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        var logger = _loggerFactory.CreateLogger<LoggingMiddleware>();
+
+        try
+        {
+            logger.LogInformation("Path: {0}, QueryString: {1}", 
+                context.Request.Path,
+                context.Request.QueryString);    
+            
+            await _next(context);
+        }
+        catch (Exception e)
+        {
+            logger.LogError(e, "");    
+        }
+    }
 }
